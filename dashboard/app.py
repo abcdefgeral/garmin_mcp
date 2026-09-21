@@ -8,10 +8,12 @@ SQLite database -- read-only, no need to speak the MCP protocol for that.
 """
 import datetime
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from garminconnect import Garmin
@@ -21,13 +23,18 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+load_dotenv(REPO_ROOT / ".env")
+
 from garmin_mcp import token_utils  # noqa: E402
 
 app = FastAPI(title="Garmin Dashboard")
 
 _client: Garmin | None = None
 
-COACH_DB_PATH = Path.home() / ".local" / "share" / "coach" / "memory.db"
+# Overridable via COACH_DATA_DIR so this can live outside ~/.local/share on
+# machines (e.g. Windows) where that's not a natural place to keep app data.
+COACH_DATA_DIR = Path(os.getenv("COACH_DATA_DIR") or (Path.home() / ".local" / "share" / "coach"))
+COACH_DB_PATH = COACH_DATA_DIR / "memory.db"
 
 # Weekly km targets for the current 4-week Base block (set 19 sep 2026),
 # re-bucketed into Monday-Sunday calendar weeks (21 sep 2026) -- summed from
@@ -42,7 +49,7 @@ BLOCK_WEEK_TARGETS = [
     ("2026-10-12", "2026-10-18", 9),
 ]
 
-BIOMECHANICS_BOARD_PATH = Path.home() / ".local" / "share" / "coach" / "biomechanics_board.json"
+BIOMECHANICS_BOARD_PATH = COACH_DATA_DIR / "biomechanics_board.json"
 
 
 def get_client() -> Garmin:

@@ -6,11 +6,18 @@ import os
 import sys
 import base64
 import threading
+from pathlib import Path
 
 import requests
+from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
 from garminconnect import Garmin, GarminConnectAuthenticationError, GarminConnectConnectionError, GarminConnectTooManyRequestsError
+
+# Load a .env sitting next to the repo root (if any) before any module below
+# reads env vars like GARMINTOKENS, so a relocated install can keep its
+# config self-contained instead of relying on machine-wide env vars.
+load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
 
 # Import all modules
 from garmin_mcp import token_utils
