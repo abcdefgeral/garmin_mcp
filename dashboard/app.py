@@ -8,9 +8,11 @@ SQLite database -- read-only, no need to speak the MCP protocol for that.
 """
 import datetime
 import json
+import math
 import os
 import sqlite3
 import sys
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -30,43 +32,82 @@ from garmin_mcp import token_utils  # noqa: E402
 app = FastAPI(title="Garmin Dashboard")
 
 _client: Garmin | None = None
+_client_lock = threading.Lock()
 
 # Overridable via COACH_DATA_DIR so this can live outside ~/.local/share on
 # machines (e.g. Windows) where that's not a natural place to keep app data.
 COACH_DATA_DIR = Path(os.getenv("COACH_DATA_DIR") or (Path.home() / ".local" / "share" / "coach"))
 COACH_DB_PATH = COACH_DATA_DIR / "memory.db"
 
-# Weekly km targets for the current 4-week Base block (set 19 sep 2026),
-# re-bucketed into Monday-Sunday calendar weeks (21 sep 2026) -- summed from
-# the actual planned distance of whichever sessions fall in each window,
-# since the plan's own sessions are anchored Sun(long)/Tue/Thu and don't line
-# up 1:1 with ISO calendar weeks.
-BLOCK_WEEK_TARGETS = [
-    ("2026-09-14", "2026-09-20", 8),
-    ("2026-09-21", "2026-09-27", 19),
-    ("2026-09-28", "2026-10-04", 21),
-    ("2026-10-05", "2026-10-11", 18),
-    ("2026-10-12", "2026-10-18", 9),
-]
-
 BIOMECHANICS_BOARD_PATH = COACH_DATA_DIR / "biomechanics_board.json"
+
+# Training-load model constants (Foster session-RPE / TrainingPeaks-style EWMA).
+# Weekly km targets now come from the `mesocycle` table in Coach Memory instead
+# of a hardcoded block (see _week_target_from_mesocycle).
+CTL_DAYS = 42
+ATL_DAYS = 7
+LOAD_HISTORY_DAYS = 180  # fixed lookback; also what "Tudo" means in the UI toggle
+SEED_DAYS = 7            # days averaged to seed CTL0/ATL0
+RECENT_DAYS_ALWAYS_RECOMPUTE = 2  # today + yesterday: always refetched (late RPE entry)
+
+# Zone -> approximate session-RPE (Borg CR10-ish), reusing the athlete's custom
+# HR-zone floors (ZONE_FLOORS/_bucket_zone, defined below) already used for zone_analysis.
+ZONE_RPE = {1: 2.0, 2: 3.5, 3: 5.5, 4: 7.5, 5: 9.0}
+DEFAULT_RPE_NO_HR = 5.0  # activities with no HR at all (e.g. some strength sessions)
+
+# Disk-persisted cache: iniciar_dashboard.bat starts a fresh uvicorn process every
+# time the dashboard is opened, so an in-memory-only cache would be wiped on every
+# launch. Persisting alongside the biomechanics board (same COACH_DATA_DIR) means
+# the expensive per-activity RPE warm-up is paid once, not on every dashboard open.
+TRAINING_LOAD_CACHE_PATH = COACH_DATA_DIR / "training_load_cache.json"
+_activity_load_cache: dict[str, dict] = {}
+_daily_load_cache: dict[str, dict] = {}
+_load_cache_lock = threading.Lock()
+
+
+def _load_training_load_cache_from_disk() -> None:
+    if not TRAINING_LOAD_CACHE_PATH.exists():
+        return
+    try:
+        with open(TRAINING_LOAD_CACHE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        _activity_load_cache.update(data.get("activity_load", {}))
+        _daily_load_cache.update(data.get("daily_load", {}))
+    except Exception:
+        pass  # corrupt/missing cache -- endpoint will just recompute on demand
+
+
+def _save_training_load_cache_to_disk() -> None:
+    try:
+        COACH_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with _load_cache_lock:
+            data = {"activity_load": _activity_load_cache, "daily_load": _daily_load_cache}
+        with open(TRAINING_LOAD_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass  # best-effort persistence -- next request just recomputes
+
+
+_load_training_load_cache_from_disk()
 
 
 def get_client() -> Garmin:
     """Lazily log in once and reuse the same Garmin client for every request."""
     global _client
     if _client is None:
-        token_path = token_utils.get_token_path()
-        client = Garmin(is_cn=False)
-        try:
-            client.login(token_path)
-        except Exception as exc:
-            raise HTTPException(
-                502,
-                f"Garmin login failed using tokens at {token_path}: {exc}. "
-                "Run 'garmin-mcp-auth' to (re)authenticate.",
-            ) from exc
-        _client = client
+        with _client_lock:
+            if _client is None:  # re-check: another thread may have logged in already
+                token_path = token_utils.get_token_path()
+                client = Garmin(is_cn=False)
+                try:
+                    client.login(token_path)
+                except Exception as exc:
+                    raise HTTPException(
+                        502,
+                        f"Garmin login failed using tokens at {token_path}: {exc}. "
+                        "Run 'garmin-mcp-auth' to (re)authenticate.",
+                    ) from exc
+                _client = client
     return _client
 
 
@@ -113,10 +154,31 @@ def _all_plans() -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def _week_target(date: str) -> int | None:
-    for start, end, km in BLOCK_WEEK_TARGETS:
-        if start <= date <= end:
-            return km
+def _active_mesocycle_row(date: str) -> dict | None:
+    """The mesocycle row (Coach Memory) whose date range contains `date`, if any."""
+    if not COACH_DB_PATH.exists():
+        return None
+    with get_coach_db() as conn:
+        row = conn.execute(
+            "SELECT id, phase_name, start_date, end_date, status, weekly_km_csv, "
+            "deload_week, target_race, target_race_date, notes FROM mesocycle "
+            "WHERE status = 'active' AND start_date <= ? AND end_date >= ? "
+            "ORDER BY start_date DESC LIMIT 1",
+            (date, date),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def _week_target_from_mesocycle(date: str) -> int | None:
+    meso = _active_mesocycle_row(date)
+    if not meso:
+        return None
+    start = datetime.date.fromisoformat(meso["start_date"])
+    d = datetime.date.fromisoformat(date)
+    week_idx = (d - start).days // 7
+    weeks = [float(x) for x in meso["weekly_km_csv"].split(",")]
+    if 0 <= week_idx < len(weeks):
+        return round(weeks[week_idx])
     return None
 
 
@@ -326,7 +388,7 @@ def api_weekly_volume():
     ]
     real_km = sum((a.get("distance") or 0) for a in running) / 1000
 
-    target_km = _week_target(today.isoformat())
+    target_km = _week_target_from_mesocycle(today.isoformat())
 
     return {
         "week_start": week_start.isoformat(),
@@ -382,6 +444,208 @@ def _bucket_zone(hr: float) -> int:
     if hr < ZONE_FLOORS[5]:
         return 4
     return 5
+
+
+def _estimate_session_rpe(avg_hr: float | None) -> tuple[float, str]:
+    """Fallback RPE (0-10) when no manual rating exists. Returns (rpe, source_label)."""
+    if avg_hr is None:
+        return DEFAULT_RPE_NO_HR, "default_estimate"
+    return ZONE_RPE[_bucket_zone(avg_hr)], "hr_zone_estimate"
+
+
+def _activity_load(client, activity_summary: dict) -> dict:
+    """Load contribution for one activity (Foster session-RPE: rpe * duration_min).
+
+    `activity_summary` is one element from client.get_activities_by_date(...),
+    which already has duration/averageHR/startTimeLocal for free. Only the
+    manually-entered RPE (directWorkoutRpe) requires a per-activity API call,
+    so results are cached by activity_id -- past activities are immutable
+    once outside the RECENT_DAYS_ALWAYS_RECOMPUTE window.
+    """
+    activity_id = str(activity_summary.get("activityId"))
+    start = activity_summary.get("startTimeLocal") or ""
+    act_date = start[:10]
+    is_recent = act_date >= (
+        datetime.date.today() - datetime.timedelta(days=RECENT_DAYS_ALWAYS_RECOMPUTE)
+    ).isoformat()
+
+    with _load_cache_lock:
+        cached = _activity_load_cache.get(activity_id)
+    if cached is not None and not is_recent:
+        return cached
+
+    duration_min = (activity_summary.get("duration") or 0) / 60
+    avg_hr = activity_summary.get("averageHR")
+    manual_rpe_raw = None
+    try:
+        full = client.get_activity(activity_id) or {}
+        manual_rpe_raw = (full.get("summaryDTO") or {}).get("directWorkoutRpe")
+    except Exception:
+        pass
+
+    if manual_rpe_raw:  # 0 and None both mean "not rated"
+        rpe, source = manual_rpe_raw / 10.0, "manual_rpe"
+    else:
+        rpe, source = _estimate_session_rpe(avg_hr)
+
+    result = {"rpe": rpe, "duration_min": duration_min, "avg_hr": avg_hr, "date": act_date, "source": source}
+    with _load_cache_lock:
+        _activity_load_cache[activity_id] = result
+    _save_training_load_cache_to_disk()
+    return result
+
+
+def _get_daily_load(client, d: str) -> dict:
+    """daily_load(d) = sum(rpe_i * duration_min_i) over d's activities. Cached per-date."""
+    is_recent = d >= (datetime.date.today() - datetime.timedelta(days=RECENT_DAYS_ALWAYS_RECOMPUTE)).isoformat()
+    with _load_cache_lock:
+        cached = _daily_load_cache.get(d)
+    if cached is not None and not is_recent:
+        return cached
+
+    try:
+        activities = client.get_activities_by_date(d, d) or []
+    except Exception:
+        activities = []
+
+    total = 0.0
+    ids = []
+    for a in activities:
+        info = _activity_load(client, a)
+        total += info["rpe"] * info["duration_min"]
+        ids.append(str(a.get("activityId")))
+
+    result = {"daily_load": round(total, 1), "activity_ids": ids}
+    with _load_cache_lock:
+        _daily_load_cache[d] = result
+    _save_training_load_cache_to_disk()
+    return result
+
+
+def _compute_ctl_atl_series(daily_loads: list[float]) -> list[dict]:
+    """daily_loads: ascending, oldest->newest. Returns [{ctl, atl, tsb}, ...], same length.
+
+    CTL[i] = CTL[i-1] + (load[i] - CTL[i-1]) * (1 - e^(-1/42))
+    ATL[i] = ATL[i-1] + (load[i] - ATL[i-1]) * (1 - e^(-1/7))
+    TSB[i] = CTL[i] - ATL[i]  (labelled PRT in the UI)
+    Seed: CTL[0] = ATL[0] = mean(daily_load[0:7]) -- avoids a fake "building fitness
+    from zero" ramp for an athlete who already has training history before the window.
+    """
+    if not daily_loads:
+        return []
+    seed = sum(daily_loads[:SEED_DAYS]) / min(SEED_DAYS, len(daily_loads))
+    ctl_alpha = 1 - math.exp(-1 / CTL_DAYS)
+    atl_alpha = 1 - math.exp(-1 / ATL_DAYS)
+    ctl = atl = seed
+    out = []
+    for i, load in enumerate(daily_loads):
+        if i == 0:
+            ctl, atl = seed, seed
+        else:
+            ctl = ctl + (load - ctl) * ctl_alpha
+            atl = atl + (load - atl) * atl_alpha
+        out.append({"ctl": round(ctl, 1), "atl": round(atl, 1), "tsb": round(ctl - atl, 1)})
+    return out
+
+
+@app.on_event("startup")
+def _warm_training_load_cache():
+    """Pre-fill the training-load cache in the background so the first real
+    page load after a fresh `uvicorn` start (iniciar_dashboard.bat) doesn't
+    have to pay the full warm-up cost synchronously."""
+
+    def _warm():
+        try:
+            client = get_client()
+            end = datetime.date.today()
+            for i in range(LOAD_HISTORY_DAYS):
+                d = (end - datetime.timedelta(days=i)).isoformat()
+                _get_daily_load(client, d)
+        except Exception:
+            pass  # best-effort; /api/training_load fills any gaps on demand
+
+    threading.Thread(target=_warm, daemon=True).start()
+
+
+@app.get("/api/training_load")
+def api_training_load():
+    """CTL/ATL/TSB ('Momento do atleta') via Foster's session-RPE method.
+
+    Fixed LOAD_HISTORY_DAYS lookback returned in full; the UI's 28/42/90/Tudo
+    toggle slices this client-side. Historical days are cached to disk (see
+    TRAINING_LOAD_CACHE_PATH); only the last RECENT_DAYS_ALWAYS_RECOMPUTE days
+    are ever refetched from Garmin.
+    """
+    client = get_client()
+    end = datetime.date.today()
+    start = end - datetime.timedelta(days=LOAD_HISTORY_DAYS - 1)
+
+    dates = []
+    daily_loads = []
+    d = start
+    while d <= end:
+        ds = d.isoformat()
+        info = _get_daily_load(client, ds)
+        dates.append(ds)
+        daily_loads.append(info["daily_load"])
+        d += datetime.timedelta(days=1)
+
+    ewma = _compute_ctl_atl_series(daily_loads)
+    series = [{"date": dates[i], "daily_load": daily_loads[i], **ewma[i]} for i in range(len(dates))]
+
+    latest = series[-1]
+    vcc = round(latest["ctl"] - series[-8]["ctl"], 1) if len(series) > 7 else None
+
+    return {
+        "history_days": LOAD_HISTORY_DAYS,
+        "series": series,
+        "latest": {"date": latest["date"], "ctl": latest["ctl"], "atl": latest["atl"], "tsb": latest["tsb"], "vcc_7d": vcc},
+    }
+
+
+@app.get("/api/periodization")
+def api_periodization():
+    """Current mesocycle phase, week-by-week targets, and progress from Coach Memory."""
+    today_str = datetime.date.today().isoformat()
+    meso = _active_mesocycle_row(today_str)
+    if not meso:
+        return {"active": False, "mesocycle": None}
+
+    start = datetime.date.fromisoformat(meso["start_date"])
+    end = datetime.date.fromisoformat(meso["end_date"])
+    today = datetime.date.today()
+    weeks = [float(x) for x in meso["weekly_km_csv"].split(",")]
+    week_idx = (today - start).days // 7
+    deload_week = meso["deload_week"]
+
+    weeks_out = [
+        {
+            "week_number": i + 1,
+            "week_start": (start + datetime.timedelta(days=7 * i)).isoformat(),
+            "target_km": w,
+            "is_deload": deload_week == i + 1,
+            "is_current": i == week_idx,
+        }
+        for i, w in enumerate(weeks)
+    ]
+    total_days = max(1, (end - start).days)
+    progress_pct = round(min(100, max(0, (today - start).days / total_days * 100)))
+
+    return {
+        "active": True,
+        "mesocycle": {
+            "id": meso["id"],
+            "phase_name": meso["phase_name"],
+            "start_date": meso["start_date"],
+            "end_date": meso["end_date"],
+            "current_week": min(max(week_idx + 1, 1), len(weeks)),
+            "total_weeks": len(weeks),
+            "progress_pct": progress_pct,
+            "target_race": meso["target_race"],
+            "target_race_date": meso["target_race_date"],
+            "weeks": weeks_out,
+        },
+    }
 
 
 def _extract_hr_series(details: dict) -> list[tuple[float, float]]:
@@ -1028,7 +1292,7 @@ def api_weekly_closing():
 
     closed = week_stats(closed_start, closed_end)
     prior = week_stats(prior_start, prior_end)
-    target_km = _week_target(closed_start.isoformat())
+    target_km = _week_target_from_mesocycle(closed_start.isoformat())
 
     pace_delta = None
     if closed["avg_pace_min_per_km"] and prior["avg_pace_min_per_km"]:

@@ -24,6 +24,9 @@
     --series-hr:      #e34948; /* red - resting HR */
     --series-fitness: #4a3aa7; /* violet - chronic load */
     --series-fatigue: #008300; /* green - acute load */
+    --series-ctl:     #4a3aa7; /* violet - carga crônica (CCR) */
+    --series-atl:     #eb6834; /* orange - carga aguda (CAG) */
+    --series-tsb:     #1baf7a; /* aqua - prontidão (PRT) */
 
     --status-good:     #0ca30c;
     --status-warning:  #fab219;
@@ -54,6 +57,9 @@
       --series-hr:      #e66767;
       --series-fitness: #9085e9;
       --series-fatigue: #008300;
+      --series-ctl:     #9085e9;
+      --series-atl:     #d95926;
+      --series-tsb:     #199e70;
 
       --status-good:     #0ca30c;
       --status-warning:  #fab219;
@@ -272,6 +278,23 @@
   .wc-stat .wc-value { font-size: 1.3rem; font-weight: 650; font-variant-numeric: tabular-nums; }
   .wc-flags { margin: 0; padding-left: 20px; font-size: 0.85rem; color: var(--text-secondary); }
   .wc-flags li { margin-bottom: 4px; }
+
+  .range-toggle { display: flex; gap: 6px; flex-wrap: wrap; }
+  .range-toggle button {
+    background: var(--page);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+    font-weight: 600;
+    padding: 4px 12px;
+    border-radius: 999px;
+    cursor: pointer;
+  }
+  .range-toggle button.active { background: var(--series-bb); border-color: var(--series-bb); color: #ffffff; }
+  .range-toggle button:hover:not(.active) { background: var(--grid); }
+
+  .peri-sub { color: var(--text-muted); font-size: 0.85rem; margin-bottom: 10px; }
+  tr.peri-current { background: rgba(255,255,255,0.04); }
 </style>
 </head>
 <body>
@@ -296,6 +319,11 @@
   <div class="card section-gap">
     <h2 style="margin-bottom:12px;">Plano de treino</h2>
     <div id="plan-wrap"></div>
+  </div>
+
+  <div class="card section-gap" id="periodizacao-card">
+    <h2 style="margin-bottom:2px;">Periodização</h2>
+    <div id="periodizacao-wrap"></div>
   </div>
 
   <div class="tiles" id="tiles"></div>
@@ -394,6 +422,22 @@
     <h2 style="margin-bottom:2px;">Fitness &amp; Freshness (42 dias)</h2>
     <div class="last-value" id="ff-last">A carregar…</div>
     <canvas id="chart-ff"></canvas>
+  </div>
+
+  <div class="card section-gap" id="momento-card">
+    <h2 style="margin-bottom:2px;">Momento do atleta</h2>
+    <div class="last-value" id="momento-sub">A carregar…</div>
+    <div class="tiles" id="momento-tiles" style="margin-bottom:14px;"></div>
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; flex-wrap:wrap; gap:8px;">
+      <div class="last-value" style="margin-bottom:0;">EVO · Evolução da carga</div>
+      <div class="range-toggle" id="momento-range-toggle">
+        <button data-range="28">28 dias</button>
+        <button data-range="42">42 dias</button>
+        <button data-range="90" class="active">90 dias</button>
+        <button data-range="all">Tudo</button>
+      </div>
+    </div>
+    <canvas id="chart-momento"></canvas>
   </div>
 
   <div class="card section-gap">
@@ -980,6 +1024,93 @@ async function loadFitnessFreshness() {
   }
 }
 
+let momentoFullSeries = null;
+let momentoChart = null;
+
+function renderMomentoChart(range) {
+  const labels = momentoFullSeries.map(d => fmtDate(d.date));
+  const slice = (arr) => range === "all" ? arr : arr.slice(-Number(range));
+  const chartLabels = slice(labels);
+  const ccr = slice(momentoFullSeries.map(d => d.ctl));
+  const cag = slice(momentoFullSeries.map(d => d.atl));
+  const prt = slice(momentoFullSeries.map(d => d.tsb));
+
+  const grid = cssVar("--grid");
+  const muted = cssVar("--text-muted");
+  const surface = cssVar("--surface-1");
+  const ink = cssVar("--text-primary");
+
+  if (momentoChart) momentoChart.destroy();
+  momentoChart = new Chart(document.getElementById("chart-momento"), {
+    type: "line",
+    data: {
+      labels: chartLabels,
+      datasets: [
+        { label: "CCR", data: ccr, borderColor: cssVar("--series-ctl"), backgroundColor: cssVar("--series-ctl"), borderWidth: 2, pointRadius: 0, tension: 0.25 },
+        { label: "CAG", data: cag, borderColor: cssVar("--series-atl"), backgroundColor: cssVar("--series-atl"), borderWidth: 2, pointRadius: 0, tension: 0.25 },
+        { label: "PRT", data: prt, borderColor: cssVar("--series-tsb"), backgroundColor: cssVar("--series-tsb"), borderWidth: 2, pointRadius: 0, tension: 0.25 },
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { display: true, position: "bottom", labels: { color: muted, font: { size: 11 }, boxWidth: 10, boxHeight: 10 } },
+        tooltip: { backgroundColor: surface, titleColor: ink, bodyColor: ink, borderColor: grid, borderWidth: 1, padding: 10 },
+      },
+      scales: {
+        x: { grid: { display: false }, ticks: { color: muted, font: { size: 10 }, maxRotation: 0 }, border: { color: cssVar("--baseline") } },
+        y: { grid: { color: grid }, ticks: { color: muted, font: { size: 10 } }, border: { display: false } },
+      }
+    }
+  });
+}
+
+async function loadTrainingLoad() {
+  const t = await fetchJSON("/api/training_load");
+  momentoFullSeries = t.series;
+
+  const tiles = document.getElementById("momento-tiles");
+  tiles.innerHTML = "";
+  tiles.appendChild(tile("PRT", t.latest.tsb, "Prontidão · pronto para puxar"));
+  tiles.appendChild(tile("CCR", t.latest.ctl, "Carga crônica (~42 dias)"));
+  tiles.appendChild(tile("CAG", t.latest.atl, "Carga aguda (~7 dias)"));
+  tiles.appendChild(tile("VCC", t.latest.vcc_7d, "Variação da CCR (7 dias)"));
+  document.getElementById("momento-sub").textContent = `Hoje, pelo histórico completo analisado (${t.history_days} dias)`;
+
+  renderMomentoChart("90");
+  document.querySelectorAll("#momento-range-toggle button").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll("#momento-range-toggle button").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      renderMomentoChart(btn.dataset.range);
+    });
+  });
+}
+
+async function loadPeriodizacao() {
+  const p = await fetchJSON("/api/periodization");
+  const wrap = document.getElementById("periodizacao-wrap");
+  if (!p.active) {
+    wrap.innerHTML = `<p class="muted">Sem mesociclo ativo.</p>`;
+    return;
+  }
+  const m = p.mesocycle;
+  const rows = m.weeks.map(w => `
+    <tr class="${w.is_current ? "peri-current" : ""}">
+      <td>Semana ${w.week_number}${w.is_deload ? " (descarga)" : ""}${w.is_current ? ` <span class="muted">(atual)</span>` : ""}</td>
+      <td>${fmtDate(w.week_start)}</td>
+      <td>${w.target_km}km</td>
+    </tr>`).join("");
+  wrap.innerHTML = `
+    <div class="peri-sub">${m.phase_name} · semana ${m.current_week} de ${m.total_weeks} · ${m.progress_pct}% concluído</div>
+    <table>
+      <thead><tr><th>Semana</th><th>Início</th><th>Meta</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
 async function loadSleepAfterRun() {
   const s = await fetchJSON("/api/sleep_after_run?count=8");
   const wrap = document.getElementById("sleepload-wrap");
@@ -1212,6 +1343,7 @@ async function main() {
     await Promise.all([
       loadReadiness(),
       loadPlan(),
+      loadPeriodizacao(),
       loadOvertrainingRisk(),
       loadSummary(),
       loadRecovery(),
@@ -1220,6 +1352,7 @@ async function main() {
       loadVolumeTrend(),
       loadVo2max(),
       loadFitnessFreshness(),
+      loadTrainingLoad(),
       loadPaceTrend(),
       loadWeeklyClosing(),
       loadSleepAfterRun(),
