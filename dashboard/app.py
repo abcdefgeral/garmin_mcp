@@ -7,18 +7,27 @@ weekly volume target) is read directly from the Coach Memory MCP's local
 SQLite database -- read-only, no need to speak the MCP protocol for that.
 """
 import datetime
+import email.utils
 import json
+import logging
 import math
 import os
+import random
 import sqlite3
 import sys
 import threading
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
-from garminconnect import Garmin
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -90,6 +99,91 @@ def _save_training_load_cache_to_disk() -> None:
 
 _load_training_load_cache_from_disk()
 
+logger = logging.getLogger("dashboard")
+
+# Bounded retry with exponential backoff + jitter for transient Garmin failures
+# (429 rate limit, 5xx, network). 4xx client errors and auth failures are not
+# retried: repeating them never helps and hammering after a 429 makes Garmin
+# throttle harder, hence the small attempt count and the delay cap.
+RETRY_MAX_ATTEMPTS = 3
+RETRY_BASE_DELAY_S = 0.5
+RETRY_MAX_DELAY_S = 10.0
+RETRY_JITTER = 0.2
+
+
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, GarminConnectTooManyRequestsError):
+        return True
+    if isinstance(exc, GarminConnectAuthenticationError):
+        return False
+    if isinstance(exc, GarminConnectConnectionError):
+        # garminconnect tags 4xx as "API client error (4xx)"; everything else
+        # under this type is a 5xx or a network-level failure.
+        return "API client error" not in str(exc)
+    return False
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """Honor a Retry-After header if the underlying HTTP response carried one."""
+    cause = exc
+    while cause is not None:
+        response = getattr(cause, "response", None)
+        headers = getattr(response, "headers", None)
+        if headers is not None:
+            value = headers.get("Retry-After")
+            if value:
+                try:
+                    return max(0.0, float(value))
+                except ValueError:
+                    try:
+                        target = email.utils.parsedate_to_datetime(value)
+                        return max(0.0, target.timestamp() - time.time())
+                    except (TypeError, ValueError):
+                        return None
+        cause = cause.__cause__
+    return None
+
+
+def _backoff_delay(attempt: int, exc: Exception) -> float:
+    retry_after = _retry_after_seconds(exc)
+    if retry_after is not None:
+        return min(retry_after, RETRY_MAX_DELAY_S)
+    delay = min(RETRY_BASE_DELAY_S * 2 ** (attempt - 1), RETRY_MAX_DELAY_S)
+    return max(0.0, delay + delay * RETRY_JITTER * (random.random() * 2 - 1))
+
+
+def _call_with_retry(fn, *args, **kwargs):
+    for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            if attempt == RETRY_MAX_ATTEMPTS or not _is_retryable(exc):
+                raise
+            delay = _backoff_delay(attempt, exc)
+            logger.warning(
+                "Garmin %s falhou (%s); tentativa %d/%d em %.1fs",
+                getattr(fn, "__name__", "call"), exc, attempt, RETRY_MAX_ATTEMPTS, delay,
+            )
+            time.sleep(delay)
+
+
+class _RetryingGarmin:
+    """Proxy that routes every Garmin client method through _call_with_retry."""
+
+    def __init__(self, client: Garmin):
+        self._client = client
+
+    def __getattr__(self, name):
+        attr = getattr(self._client, name)
+        if not callable(attr):
+            return attr
+
+        def wrapper(*args, **kwargs):
+            return _call_with_retry(attr, *args, **kwargs)
+
+        wrapper.__name__ = name
+        return wrapper
+
 
 def get_client() -> Garmin:
     """Lazily log in once and reuse the same Garmin client for every request."""
@@ -107,8 +201,122 @@ def get_client() -> Garmin:
                         f"Garmin login failed using tokens at {token_path}: {exc}. "
                         "Run 'garmin-mcp-auth' to (re)authenticate.",
                     ) from exc
-                _client = client
+                _client = _RetryingGarmin(client)
     return _client
+
+
+# Per-day wellness cache (sleep, HRV, resting HR, body battery). readiness,
+# recovery, overtraining_risk and sleep_after_run all read overlapping day
+# windows, so without this every page open costs ~130 Garmin calls. Past days
+# stop changing once the watch has synced, so they're persisted to disk; today
+# and yesterday are always refetched (sleep/HRV land on the wake date only after
+# sync). A day is cached only when every call succeeded, and -- unless it's old
+# enough that a late sync is implausible -- only once sleep and RHR are present.
+WELLNESS_CACHE_PATH = COACH_DATA_DIR / "wellness_cache.json"
+WELLNESS_RECENT_DAYS_ALWAYS_REFETCH = 2
+WELLNESS_SETTLED_DAYS = 7
+WELLNESS_CACHE_MAX_AGE_DAYS = 120
+_wellness_cache: dict[str, dict] = {}
+_wellness_cache_lock = threading.Lock()
+
+
+def _load_wellness_cache_from_disk() -> None:
+    if not WELLNESS_CACHE_PATH.exists():
+        return
+    try:
+        with open(WELLNESS_CACHE_PATH, encoding="utf-8") as f:
+            _wellness_cache.update(json.load(f))
+    except Exception:
+        pass  # corrupt/missing cache -- days are just refetched
+
+
+def _save_wellness_cache_to_disk() -> None:
+    cutoff = (datetime.date.today() - datetime.timedelta(days=WELLNESS_CACHE_MAX_AGE_DAYS)).isoformat()
+    try:
+        COACH_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with _wellness_cache_lock:
+            for d in [d for d in _wellness_cache if d < cutoff]:
+                del _wellness_cache[d]
+            data = dict(_wellness_cache)
+        tmp = WELLNESS_CACHE_PATH.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, WELLNESS_CACHE_PATH)
+    except Exception:
+        pass  # best-effort persistence
+
+
+_load_wellness_cache_from_disk()
+
+
+def _fetch_wellness_day(client, d: str) -> dict:
+    """Fetch and normalize one day. `errors` lists the sources that failed."""
+    errors = []
+
+    def fetch(name, fn):
+        try:
+            return fn(d) or {}
+        except Exception:
+            errors.append(name)
+            return {}
+
+    stats = fetch("stats", client.get_stats)
+    sleep = fetch("sleep", client.get_sleep_data)
+    hrv = fetch("hrv", client.get_hrv_data)
+
+    daily_sleep = sleep.get("dailySleepDTO") or {}
+    sleep_seconds = daily_sleep.get("sleepTimeSeconds")
+    overall_score = (daily_sleep.get("sleepScores") or {}).get("overall") or {}
+    hrv_summary = hrv.get("hrvSummary") or {}
+    return {
+        "date": d,
+        "resting_hr": stats.get("restingHeartRate"),
+        "body_battery": stats.get("bodyBatteryMostRecentValue"),
+        "sleep_hours": round(sleep_seconds / 3600, 2) if sleep_seconds else None,
+        "sleep_score": overall_score.get("value"),
+        "hrv_avg": hrv_summary.get("lastNightAvg"),
+        "hrv_status": hrv_summary.get("status"),
+        "errors": errors,
+    }
+
+
+def _is_wellness_day_cacheable(day: dict, today: datetime.date) -> bool:
+    if day["errors"]:
+        return False
+    age = (today - datetime.date.fromisoformat(day["date"])).days
+    if age < WELLNESS_RECENT_DAYS_ALWAYS_REFETCH:
+        return False
+    if age >= WELLNESS_SETTLED_DAYS:
+        return True
+    return day["sleep_hours"] is not None and day["resting_hr"] is not None
+
+
+def _wellness_day(client, d: str) -> dict:
+    with _wellness_cache_lock:
+        cached = _wellness_cache.get(d)
+    if cached is not None:
+        return dict(cached)
+    day = _fetch_wellness_day(client, d)
+    if _is_wellness_day_cacheable(day, datetime.date.today()):
+        with _wellness_cache_lock:
+            _wellness_cache[d] = day
+    return dict(day)
+
+
+def _wellness_days(client, start: datetime.date, end: datetime.date) -> list[dict]:
+    """Normalized days start..end inclusive; persists any newly cached days."""
+    with _wellness_cache_lock:
+        before = len(_wellness_cache)
+    days = []
+    current = start
+    while current <= end:
+        days.append(_wellness_day(client, current.isoformat()))
+        current += datetime.timedelta(days=1)
+    with _wellness_cache_lock:
+        grew = len(_wellness_cache) != before
+    if grew:
+        _save_wellness_cache_to_disk()
+    return days
 
 
 def get_coach_db() -> sqlite3.Connection:
@@ -207,44 +415,7 @@ def api_recovery(days: int = Query(default=14, ge=1, le=28)):
     client = get_client()
     end = datetime.date.today()
     start = end - datetime.timedelta(days=days - 1)
-
-    days_list = []
-    current = start
-    while current <= end:
-        d = current.isoformat()
-
-        try:
-            stats = client.get_stats(d) or {}
-        except Exception:
-            stats = {}
-
-        try:
-            sleep = client.get_sleep_data(d) or {}
-        except Exception:
-            sleep = {}
-        daily_sleep = sleep.get("dailySleepDTO") or {}
-        overall_score = (daily_sleep.get("sleepScores") or {}).get("overall") or {}
-        sleep_seconds = daily_sleep.get("sleepTimeSeconds")
-
-        try:
-            hrv = client.get_hrv_data(d) or {}
-        except Exception:
-            hrv = {}
-        hrv_summary = hrv.get("hrvSummary") or {}
-
-        days_list.append(
-            {
-                "date": d,
-                "resting_hr": stats.get("restingHeartRate"),
-                "body_battery": stats.get("bodyBatteryMostRecentValue"),
-                "sleep_hours": round(sleep_seconds / 3600, 2) if sleep_seconds else None,
-                "sleep_score": overall_score.get("value"),
-                "hrv_avg": hrv_summary.get("lastNightAvg"),
-                "hrv_status": hrv_summary.get("status"),
-            }
-        )
-        current += datetime.timedelta(days=1)
-    return {"days": days_list}
+    return {"days": _wellness_days(client, start, end)}
 
 
 @app.get("/api/readiness")
@@ -260,50 +431,29 @@ def api_readiness():
     today_str = today.isoformat()
 
     window_start = today - datetime.timedelta(days=8)
-    days_list = []
-    current = window_start
-    while current <= today:
-        d = current.isoformat()
-        try:
-            stats = client.get_stats(d) or {}
-        except Exception:
-            stats = {}
-        try:
-            sleep = client.get_sleep_data(d) or {}
-        except Exception:
-            sleep = {}
-        daily_sleep = sleep.get("dailySleepDTO") or {}
-        sleep_seconds = daily_sleep.get("sleepTimeSeconds")
-        try:
-            hrv = client.get_hrv_data(d) or {}
-        except Exception:
-            hrv = {}
-        hrv_summary = hrv.get("hrvSummary") or {}
-
-        days_list.append({
-            "date": d,
-            "resting_hr": stats.get("restingHeartRate"),
-            "body_battery": stats.get("bodyBatteryMostRecentValue"),
-            "sleep_hours": round(sleep_seconds / 3600, 2) if sleep_seconds else None,
-            "hrv_avg": hrv_summary.get("lastNightAvg"),
-            "hrv_status": hrv_summary.get("status"),
-        })
-        current += datetime.timedelta(days=1)
+    days_list = _wellness_days(client, window_start, today)
 
     reasons = []
     flags = 0
 
     last_night = days_list[-1] if days_list else {}
+    last_night_errors = last_night.get("errors") or []
 
     sleep_hours = last_night.get("sleep_hours")
-    if sleep_hours is not None:
+    sleep_pending = sleep_hours is None
+    if not sleep_pending:
         if sleep_hours < 6:
             flags += 1
             reasons.append(f"Sono curto: {sleep_hours}h esta noite (minimo recomendado 7h)")
         elif sleep_hours < 7:
             reasons.append(f"Sono abaixo do ideal: {sleep_hours}h (recomendado 7h+)")
+    elif "sleep" in last_night_errors:
+        reasons.append("Falha ao obter o sono do Garmin -- trata o sono como indisponivel, nao como noite sem dormir")
     else:
-        reasons.append("Ainda sem dados de sono da ultima noite")
+        reasons.append(
+            "Sono da ultima noite ainda nao sincronizado (costuma aparecer apos acordar e sincronizar o relogio) "
+            "-- ausencia de dados nao significa noite sem dormir"
+        )
 
     hrv_status = last_night.get("hrv_status")
     if hrv_status and hrv_status not in ("BALANCED", "NONE"):
@@ -342,7 +492,11 @@ def api_readiness():
         flags += 1
         reasons.append(f"Body Battery baixo: {body_battery}/100")
 
-    if flags == 0:
+    # Without last night's sleep a clean slate is not evidence of readiness, so
+    # don't call it "apto"; warning flags from other signals still stand.
+    if flags == 0 and sleep_pending:
+        verdict, label = "pendente", "Aguardando dados da noite"
+    elif flags == 0:
         verdict, label = "apto", "Apto para o treino de hoje"
     elif flags == 1:
         verdict, label = "cautela", "Apto com cautela"
@@ -352,6 +506,9 @@ def api_readiness():
     if not reasons:
         reasons.append("Sinais de recuperacao dentro do normal")
 
+    hrv_pending = last_night.get("hrv_avg") is None
+    confidence = "alta" if not (sleep_pending or hrv_pending or last_night_errors) else "parcial"
+
     plan = _plan_for_date(today_str)
     next_plan = _next_plan_after(today_str) if not plan else None
 
@@ -359,6 +516,7 @@ def api_readiness():
         "date": today_str,
         "verdict": verdict,
         "label": label,
+        "confidence": confidence,
         "flags": flags,
         "reasons": reasons,
         "today_plan": plan,
@@ -973,21 +1131,16 @@ def api_sleep_after_run(count: int = Query(default=10, ge=1, le=20)):
             continue
         run_date = datetime.date.fromisoformat(start_time[:10])
         next_day = (run_date + datetime.timedelta(days=1)).isoformat()
-        try:
-            sleep = client.get_sleep_data(next_day) or {}
-        except Exception:
-            sleep = {}
-        daily_sleep = sleep.get("dailySleepDTO") or {}
-        sleep_seconds = daily_sleep.get("sleepTimeSeconds")
-        overall = (daily_sleep.get("sleepScores") or {}).get("overall") or {}
+        night = _wellness_day(client, next_day)
         out.append({
             "run_date": run_date.isoformat(),
             "run_name": a.get("activityName"),
             "run_distance_km": round((a.get("distance") or 0) / 1000, 1),
             "next_night_date": next_day,
-            "sleep_hours": round(sleep_seconds / 3600, 2) if sleep_seconds else None,
-            "sleep_score": overall.get("value"),
+            "sleep_hours": night["sleep_hours"],
+            "sleep_score": night["sleep_score"],
         })
+    _save_wellness_cache_to_disk()
     return {"runs": out}
 
 
@@ -998,34 +1151,7 @@ def api_overtraining_risk(days: int = Query(default=21, ge=7, le=42)):
     today = datetime.date.today()
     start = today - datetime.timedelta(days=days - 1)
 
-    daily = []
-    current = start
-    while current <= today:
-        d = current.isoformat()
-        try:
-            stats = client.get_stats(d) or {}
-        except Exception:
-            stats = {}
-        try:
-            hrv = client.get_hrv_data(d) or {}
-        except Exception:
-            hrv = {}
-        hrv_summary = hrv.get("hrvSummary") or {}
-        try:
-            sleep = client.get_sleep_data(d) or {}
-        except Exception:
-            sleep = {}
-        daily_sleep = sleep.get("dailySleepDTO") or {}
-        sleep_seconds = daily_sleep.get("sleepTimeSeconds")
-        daily.append({
-            "date": d,
-            "resting_hr": stats.get("restingHeartRate"),
-            "body_battery": stats.get("bodyBatteryMostRecentValue"),
-            "hrv_avg": hrv_summary.get("lastNightAvg"),
-            "hrv_status": hrv_summary.get("status"),
-            "sleep_hours": round(sleep_seconds / 3600, 2) if sleep_seconds else None,
-        })
-        current += datetime.timedelta(days=1)
+    daily = _wellness_days(client, start, today)
 
     reasons = []
     flags = 0

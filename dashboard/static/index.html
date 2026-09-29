@@ -762,8 +762,11 @@ async function loadReadiness() {
     planHtml = "Sem sessão planeada para hoje nem próximas sessões no plano.";
   }
   const reasonsHtml = r.reasons.map(x => `<li>${x}</li>`).join("");
+  const confidenceHtml = r.confidence === "parcial"
+    ? ` <span class="badge badge-pending" title="Faltam dados da última noite (sono e/ou HRV)">confiança parcial</span>`
+    : "";
   el.innerHTML = `
-    <div class="label">${r.label}</div>
+    <div class="label">${r.label}${confidenceHtml}</div>
     <div class="plan">${planHtml}</div>
     <ul>${reasonsHtml}</ul>
   `;
