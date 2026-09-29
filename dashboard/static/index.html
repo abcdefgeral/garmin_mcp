@@ -28,6 +28,13 @@
     --series-atl:     #eb6834; /* orange - carga aguda (CAG) */
     --series-tsb:     #1baf7a; /* aqua - prontidão (PRT) */
 
+    /* Sleep stages (categorical, validated light: CVD ΔE >= 23; light/awake
+       sit below 3:1 so the chart always carries a legend + text values) */
+    --sleep-deep:  #2a78d6;
+    --sleep-light: #1baf7a;
+    --sleep-rem:   #4a3aa7;
+    --sleep-awake: #e87ba4;
+
     --status-good:     #0ca30c;
     --status-warning:  #fab219;
     --status-critical: #d03b3b;
@@ -60,6 +67,12 @@
       --series-ctl:     #9085e9;
       --series-atl:     #d95926;
       --series-tsb:     #199e70;
+
+      /* Sleep stages, stepped for the dark surface (all >= 3:1, CVD ΔE >= 16) */
+      --sleep-deep:  #3987e5;
+      --sleep-light: #199e70;
+      --sleep-rem:   #9085e9;
+      --sleep-awake: #d55181;
 
       --status-good:     #0ca30c;
       --status-warning:  #fab219;
@@ -403,6 +416,21 @@
       <canvas id="chart-score"></canvas>
     </div>
     <div class="card">
+      <h2>Fases do sono (14 noites)</h2>
+      <div class="last-value" id="stages-last"></div>
+      <canvas id="chart-stages"></canvas>
+    </div>
+    <div class="card">
+      <h2>Respiração no sono (14 noites)</h2>
+      <div class="last-value" id="resp-last"></div>
+      <canvas id="chart-resp"></canvas>
+    </div>
+    <div class="card">
+      <h2>SpO2 no sono (14 noites)</h2>
+      <div class="last-value" id="spo2-last"></div>
+      <canvas id="chart-spo2"></canvas>
+    </div>
+    <div class="card">
       <h2>FC em repouso (14 dias)</h2>
       <div class="last-value" id="hr-last"></div>
       <canvas id="chart-hr"></canvas>
@@ -525,7 +553,17 @@ function lineChart(canvasId, labels, values, colorVar, unit, yStepSize, spanGaps
         borderColor: color,
         backgroundColor: color,
         borderWidth: 2,
-        pointRadius: 0,
+        // Without spanGaps a value between two gaps has no segment to draw,
+        // so give isolated points a marker or they vanish from the chart.
+        pointRadius: (ctx) => {
+          if (spanGaps) return 0;
+          const i = ctx.dataIndex;
+          const isolated = values[i] != null && values[i - 1] == null && values[i + 1] == null;
+          return isolated ? 4 : 0;
+        },
+        pointBackgroundColor: color,
+        pointBorderColor: surface,
+        pointBorderWidth: 2,
         pointHoverRadius: 5,
         pointHoverBackgroundColor: color,
         pointHoverBorderColor: surface,
@@ -623,6 +661,86 @@ function barChart(canvasId, labels, values, colorVar, unit) {
         }
       }
     }
+  });
+}
+
+function fmtMinutes(min) {
+  if (min == null) return "—";
+  const m = Math.round(min);
+  return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}`;
+}
+
+// Stacked bars of sleep stages per night, in hours. Bottom-up by depth
+// (deep, light, REM) with awake on top; a 2px surface gap separates segments.
+const SLEEP_STAGES = [
+  { key: "sleep_deep_min", label: "Profundo", colorVar: "--sleep-deep" },
+  { key: "sleep_light_min", label: "Leve", colorVar: "--sleep-light" },
+  { key: "sleep_rem_min", label: "REM", colorVar: "--sleep-rem" },
+  { key: "sleep_awake_min", label: "Acordado", colorVar: "--sleep-awake" },
+];
+
+function sleepStagesChart(canvasId, labels, days) {
+  const grid = cssVar("--grid");
+  const muted = cssVar("--text-muted");
+  const surface = cssVar("--surface-1");
+  const ink = cssVar("--text-primary");
+
+  const datasets = SLEEP_STAGES.map((s, i) => ({
+    label: s.label,
+    data: days.map(d => d[s.key] != null ? +(d[s.key] / 60).toFixed(2) : null),
+    minutes: days.map(d => d[s.key]),
+    backgroundColor: cssVar(s.colorVar),
+    borderColor: surface,
+    borderWidth: { top: 2, right: 0, bottom: 0, left: 0 },
+    borderSkipped: false,
+    borderRadius: i === SLEEP_STAGES.length - 1 ? { topLeft: 4, topRight: 4 } : 0,
+    maxBarThickness: 28,
+  }));
+
+  return new Chart(document.getElementById(canvasId), {
+    type: "bar",
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { display: true, position: "bottom", labels: { color: muted, font: { size: 11 }, boxWidth: 10, boxHeight: 10 } },
+        tooltip: {
+          backgroundColor: surface,
+          titleColor: ink,
+          bodyColor: ink,
+          footerColor: ink,
+          borderColor: grid,
+          borderWidth: 1,
+          padding: 10,
+          callbacks: {
+            label: (ctx) => `${ctx.dataset.label}: ${fmtMinutes(ctx.dataset.minutes[ctx.dataIndex])}`,
+            footer: (items) => {
+              const total = days[items[0].dataIndex];
+              const asleep = ["sleep_deep_min", "sleep_light_min", "sleep_rem_min"]
+                .reduce((sum, k) => sum + (total[k] ?? 0), 0);
+              return asleep ? `Dormindo: ${fmtMinutes(asleep)}` : "sem dados";
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          stacked: true,
+          grid: { display: false },
+          ticks: { color: muted, font: { size: 10 }, maxRotation: 0 },
+          border: { color: cssVar("--baseline") },
+        },
+        y: {
+          stacked: true,
+          beginAtZero: true,
+          grid: { color: grid },
+          ticks: { color: muted, font: { size: 10 }, callback: (v) => `${v}h` },
+          border: { display: false },
+        },
+      },
+    },
   });
 }
 
@@ -805,6 +923,23 @@ async function loadRecovery() {
   document.getElementById("hrv-last").textContent = hrv != null ? `Última noite: ${hrv}ms` : "Sem dados recentes";
   document.getElementById("score-last").textContent = sc != null ? `Última noite: ${sc}/100` : "Sem dados recentes";
   document.getElementById("hr-last").textContent = hr != null ? `Último valor: ${hr}bpm` : "Sem dados recentes";
+
+  sleepStagesChart("chart-stages", labels, r.days);
+  lineChart("chart-resp", labels, r.days.map(d => d.respiration_avg), "--series-fitness", "rpm", undefined, false);
+  lineChart("chart-spo2", labels, r.days.map(d => d.spo2_avg), "--series-bb", "%", undefined, false);
+
+  const lastNight = [...r.days].reverse().find(d => d.sleep_deep_min != null);
+  document.getElementById("stages-last").textContent = lastNight
+    ? `Última noite: profundo ${fmtMinutes(lastNight.sleep_deep_min)} · leve ${fmtMinutes(lastNight.sleep_light_min)} · REM ${fmtMinutes(lastNight.sleep_rem_min)} · acordado ${fmtMinutes(lastNight.sleep_awake_min)}`
+    : "Sem dados recentes";
+  const resp = lastValue(r.days, "respiration_avg");
+  document.getElementById("resp-last").textContent = resp != null
+    ? `Última noite: ${resp} respirações/min · só tendência, não é medida clínica`
+    : "Sem dados recentes";
+  const spo2Night = [...r.days].reverse().find(d => d.spo2_avg != null);
+  document.getElementById("spo2-last").textContent = spo2Night
+    ? `Última noite: média ${spo2Night.spo2_avg}%${spo2Night.spo2_lowest != null ? ` · mínimo ${spo2Night.spo2_lowest}%` : ""} · leitura de pulso, só tendência`
+    : "Sem dados recentes";
 }
 
 async function loadOvertrainingRisk() {
@@ -983,11 +1118,20 @@ function weeklyRecoveryHtml(rec) {
       <div class="wc-value">${v != null ? `${v}${unit}` : "—"}</div>
       <div class="wc-delta">${fmtDelta(rec.delta[key], unit)}</div></div>`;
   };
+  const minutesStat = (label, key) => {
+    const d = rec.delta[key];
+    const deltaTxt = d == null ? "sem comparação" : `${d > 0 ? "+" : d < 0 ? "−" : "±"}${Math.abs(d)}min vs anterior`;
+    return `<div class="wc-stat"><div class="wc-label">${label}</div>
+      <div class="wc-value">${fmtMinutes(rec.current[key])}</div>
+      <div class="wc-delta">${deltaTxt}</div></div>`;
+  };
   const confidenceTxt = rec.confidence === "alta" ? "" : ` <span class="badge badge-pending">confiança ${rec.confidence}</span>`;
   return `
     <div class="wc-section">Recuperação (média da semana)${confidenceTxt}</div>
     <div class="wc-stats">
       ${stat("Sono", "sleep_hours", "h")}
+      ${minutesStat("Sono profundo", "deep_sleep_min")}
+      ${minutesStat("REM", "rem_sleep_min")}
       ${stat("HRV", "hrv_avg", "ms")}
       ${stat("FC repouso", "resting_hr", "bpm")}
       ${stat("Stress", "avg_stress", "")}

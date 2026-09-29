@@ -55,10 +55,19 @@ class FakeGarmin:
         self._maybe_fail("sleep", d)
         v = self.data.get(d, {})
         if v.get("sleep_s") is None:
-            return {"dailySleepDTO": {}}
+            # Garmin still sends a DTO with stray sub-metrics on nights it didn't record
+            return {"dailySleepDTO": {"averageRespirationValue": 14.0}}
         return {"dailySleepDTO": {
             "sleepTimeSeconds": v["sleep_s"],
             "sleepScores": {"overall": {"value": v.get("score")}},
+            "deepSleepSeconds": v.get("deep_s"),
+            "lightSleepSeconds": v.get("light_s"),
+            "remSleepSeconds": v.get("rem_s"),
+            "awakeSleepSeconds": v.get("awake_s"),
+            "averageRespirationValue": v.get("resp"),
+            "averageSpO2Value": v.get("spo2"),
+            "lowestSpO2Value": v.get("spo2_low"),
+            "avgSleepStress": v.get("sleep_stress"),
         }}
 
     def get_hrv_data(self, d):
@@ -396,9 +405,10 @@ def test_missing_training_readiness_is_ignored(monkeypatch, tr):
 
 # ------------------------------------------------------ weekly recovery comparison
 
-def week(sleep_h=7.5, hrv=60, rhr=50, stress=25, bb=40, n=7):
+def week(sleep_h=7.5, hrv=60, rhr=50, stress=25, bb=40, deep=90, rem=80, n=7):
     return [
-        {"sleep_hours": sleep_h, "hrv_avg": hrv, "resting_hr": rhr, "avg_stress": stress, "body_battery": bb}
+        {"sleep_hours": sleep_h, "hrv_avg": hrv, "resting_hr": rhr, "avg_stress": stress, "body_battery": bb,
+         "sleep_deep_min": deep, "sleep_rem_min": rem}
         for _ in range(n)
     ]
 
@@ -474,3 +484,29 @@ def test_missing_wake_body_battery_is_ignored(monkeypatch):
     r = readiness_with(FakeGarmin(history(bb=10, bb_wake=None, bb_charged=None)), monkeypatch)
     assert r["verdict"] == "apto"
     assert not any("Body Battery" in x for x in r["reasons"])
+
+
+# ----------------------------------------------- sleep stages, respiration, SpO2
+
+def test_sleep_stages_respiration_and_spo2_are_extracted():
+    night = {**full_day(sleep_h=7.3), "deep_s": 5340, "light_s": 17160, "rem_s": 3840, "awake_s": 0,
+             "resp": 15.0, "spo2": 95.0, "spo2_low": 85, "sleep_stress": 20.0}
+    d = dash._wellness_day(FakeGarmin({day(10): night}), day(10))
+    assert (d["sleep_deep_min"], d["sleep_light_min"], d["sleep_rem_min"], d["sleep_awake_min"]) == (89, 286, 64, 0)
+    assert (d["respiration_avg"], d["spo2_avg"], d["spo2_lowest"], d["sleep_stress"]) == (15.0, 95.0, 85, 20.0)
+
+
+def test_sleep_submetrics_are_empty_on_unrecorded_nights():
+    d = dash._wellness_day(FakeGarmin({day(10): {"rhr": 50}}), day(10))
+    assert d["sleep_hours"] is None
+    assert all(d[k] is None for k in (
+        "sleep_deep_min", "sleep_light_min", "sleep_rem_min", "sleep_awake_min",
+        "respiration_avg", "spo2_avg", "spo2_lowest", "sleep_stress",
+    ))
+
+
+def test_weekly_recovery_includes_deep_and_rem_sleep():
+    rec = dash._weekly_recovery_comparison(week(deep=95, rem=70), week(deep=80, rem=75))
+    assert rec["current"]["deep_sleep_min"] == 95 and rec["delta"]["deep_sleep_min"] == 15
+    assert rec["current"]["rem_sleep_min"] == 70 and rec["delta"]["rem_sleep_min"] == -5
+    assert rec["bottlenecks"] == ["Recuperacao estavel vs semana anterior"]  # stages never alert

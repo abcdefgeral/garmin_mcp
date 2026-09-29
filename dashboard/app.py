@@ -218,7 +218,7 @@ WELLNESS_SETTLED_DAYS = 7
 WELLNESS_CACHE_MAX_AGE_DAYS = 120
 # Bump when _fetch_wellness_day gains/changes fields: entries written by an
 # older version are dropped on load and simply refetched.
-WELLNESS_CACHE_VERSION = 3
+WELLNESS_CACHE_VERSION = 4
 _wellness_cache: dict[str, dict] = {}
 _wellness_cache_lock = threading.Lock()
 
@@ -289,6 +289,15 @@ def _fetch_wellness_day(client, d: str) -> dict:
     avg_stress = stats.get("averageStressLevel")
     if avg_stress is not None and avg_stress < 0:
         avg_stress = None  # Garmin uses negative levels for "not enough data"
+
+    def sleep_field(key):
+        # Only trust sleep sub-metrics when a night was actually recorded.
+        return daily_sleep.get(key) if sleep_seconds else None
+
+    def stage_minutes(key):
+        seconds = sleep_field(key)
+        return round(seconds / 60) if seconds is not None else None
+
     return {
         "date": d,
         "resting_hr": stats.get("restingHeartRate"),
@@ -300,6 +309,15 @@ def _fetch_wellness_day(client, d: str) -> dict:
         "avg_stress": avg_stress,
         "sleep_hours": round(sleep_seconds / 3600, 2) if sleep_seconds else None,
         "sleep_score": overall_score.get("value"),
+        "sleep_deep_min": stage_minutes("deepSleepSeconds"),
+        "sleep_light_min": stage_minutes("lightSleepSeconds"),
+        "sleep_rem_min": stage_minutes("remSleepSeconds"),
+        "sleep_awake_min": stage_minutes("awakeSleepSeconds"),
+        # Wrist-sensor trends only -- shown as context, never used for alerts.
+        "respiration_avg": sleep_field("averageRespirationValue"),
+        "spo2_avg": sleep_field("averageSpO2Value"),
+        "spo2_lowest": sleep_field("lowestSpO2Value"),
+        "sleep_stress": sleep_field("avgSleepStress"),
         "hrv_avg": hrv_summary.get("lastNightAvg"),
         "hrv_status": hrv_summary.get("status"),
         "errors": errors,
@@ -1565,6 +1583,8 @@ RECOVERY_METRICS = {
     "resting_hr": ("resting_hr", None),
     "avg_stress": ("avg_stress", None),
     "body_battery_end": ("body_battery", None),
+    "deep_sleep_min": ("sleep_deep_min", None),
+    "rem_sleep_min": ("sleep_rem_min", None),
 }
 LOW_WEEKLY_SLEEP_HOURS = 6.5
 
