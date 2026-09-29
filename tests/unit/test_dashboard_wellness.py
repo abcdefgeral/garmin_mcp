@@ -46,6 +46,8 @@ class FakeGarmin:
         return {
             "restingHeartRate": v.get("rhr"),
             "bodyBatteryMostRecentValue": v.get("bb"),
+            "bodyBatteryAtWakeTime": v.get("bb_wake"),
+            "bodyBatteryChargedValue": v.get("bb_charged"),
             "averageStressLevel": v.get("stress"),
         }
 
@@ -73,7 +75,8 @@ class FakeGarmin:
 
 
 def full_day(rhr=50, sleep_h=7.5, hrv=60, stress=25):
-    return {"rhr": rhr, "bb": 70, "stress": stress, "sleep_s": int(sleep_h * 3600), "score": 80, "hrv": hrv}
+    return {"rhr": rhr, "bb": 70, "bb_wake": 80, "bb_charged": 45, "stress": stress,
+            "sleep_s": int(sleep_h * 3600), "score": 80, "hrv": hrv}
 
 
 @pytest.fixture(autouse=True)
@@ -81,6 +84,8 @@ def isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(dash, "WELLNESS_CACHE_PATH", tmp_path / "wellness_cache.json")
     monkeypatch.setattr(dash, "COACH_DATA_DIR", tmp_path)
     monkeypatch.setattr(dash, "_wellness_cache", {})
+    monkeypatch.setattr(dash, "_recent_wellness_cache", {})
+    monkeypatch.setattr(dash, "_wellness_day_locks", {})
     monkeypatch.setattr(dash.time, "sleep", lambda s: None)
     monkeypatch.setattr(dash, "_plan_for_date", lambda d: None)
     monkeypatch.setattr(dash, "_next_plan_after", lambda d: None)
@@ -197,12 +202,61 @@ def test_cache_survives_restart(isolated_cache):
     assert client2.calls == []
 
 
+@pytest.fixture
+def clock(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(dash, "_monotonic", lambda: now[0])
+    return now
+
+
 @pytest.mark.parametrize("offset", [0, 1])
-def test_today_and_yesterday_always_refetched(offset):
+def test_today_and_yesterday_are_never_persisted(offset):
+    client = FakeGarmin({day(offset): full_day()})
+    dash._wellness_day(client, day(offset))
+    assert day(offset) not in dash._wellness_cache
+
+
+@pytest.mark.parametrize("offset", [0, 1])
+def test_recent_day_served_from_short_cache_then_refetched(offset, clock):
     client = FakeGarmin({day(offset): full_day()})
     dash._wellness_day(client, day(offset))
     dash._wellness_day(client, day(offset))
+    assert len(client.calls) == 3  # second call within TTL: no Garmin request
+
+    clock[0] += dash.WELLNESS_RECENT_TTL_S + 1
+    dash._wellness_day(client, day(offset))
+    assert len(client.calls) == 6  # TTL expired: picks up a fresh watch sync
+
+
+def test_failed_recent_fetch_is_retried_immediately(clock):
+    client = FakeGarmin({day(0): full_day()}, failing={("sleep", day(0))})
+    dash._wellness_day(client, day(0))
+    client.failing.clear()
+    assert dash._wellness_day(client, day(0))["sleep_hours"] == 7.5
     assert len(client.calls) == 6
+
+
+def test_concurrent_requests_for_same_day_share_one_fetch():
+    import threading
+
+    release = threading.Event()
+
+    class SlowGarmin(FakeGarmin):
+        def get_stats(self, d):
+            release.wait(timeout=5)
+            return super().get_stats(d)
+
+    client = SlowGarmin({day(0): full_day()})
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(dash._wellness_day(client, day(0))))
+               for _ in range(3)]
+    for t in threads:
+        t.start()
+    release.set()
+    for t in threads:
+        t.join(timeout=5)
+    assert len(results) == 3
+    assert len(client.calls) == 3  # one stats + sleep + hrv fetch, not three of each
 
 
 def test_recent_day_without_sleep_is_not_cached_yet():
@@ -280,9 +334,9 @@ def test_endpoints_share_the_cache(monkeypatch):
     first = len(client.calls)
     dash.api_overtraining_risk(days=21)
     dash.api_recovery(days=14)
-    # Only uncached days are fetched again: today+yesterday per endpoint, plus
-    # the 12 older overtraining days not covered by readiness's window.
-    assert len(client.calls) - first == 3 * (2 + 12) + 3 * 2
+    # Only the 12 older overtraining days not covered by readiness's window are
+    # new; today/yesterday come from the short-lived recent cache.
+    assert len(client.calls) - first == 3 * 12
 
 
 # ------------------------------------------------- stress + Garmin Training Readiness
@@ -396,3 +450,27 @@ def test_weekly_closing_includes_recovery(monkeypatch):
     assert rec["previous"]["sleep_hours"] == 8.0
     assert rec["delta"]["sleep_hours"] == -1.0
     assert any("Sono caiu 12%" in b for b in rec["bottlenecks"])
+
+
+# ------------------------------------------------------- Body Battery at wake time
+
+def test_evening_drained_body_battery_does_not_flip_the_verdict(monkeypatch):
+    # Woke up at 82; by the evening the live value has drained to 15.
+    r = readiness_with(FakeGarmin(history(bb=15, bb_wake=82, bb_charged=44)), monkeypatch)
+    assert r["verdict"] == "apto"
+    assert r["reasons"] == [
+        "Sinais de recuperacao dentro do normal",
+        "Body Battery ao acordar: 82/100 (+44 recarregado durante a noite)",
+    ]
+
+
+def test_low_body_battery_at_wake_is_a_flag(monkeypatch):
+    r = readiness_with(FakeGarmin(history(bb=70, bb_wake=20, bb_charged=5)), monkeypatch)
+    assert r["verdict"] == "cautela"
+    assert "Body Battery baixo ao acordar: 20/100 (+5 recarregado durante a noite)" in r["reasons"]
+
+
+def test_missing_wake_body_battery_is_ignored(monkeypatch):
+    r = readiness_with(FakeGarmin(history(bb=10, bb_wake=None, bb_charged=None)), monkeypatch)
+    assert r["verdict"] == "apto"
+    assert not any("Body Battery" in x for x in r["reasons"])

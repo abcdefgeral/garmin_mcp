@@ -218,9 +218,19 @@ WELLNESS_SETTLED_DAYS = 7
 WELLNESS_CACHE_MAX_AGE_DAYS = 120
 # Bump when _fetch_wellness_day gains/changes fields: entries written by an
 # older version are dropped on load and simply refetched.
-WELLNESS_CACHE_VERSION = 2
+WELLNESS_CACHE_VERSION = 3
 _wellness_cache: dict[str, dict] = {}
 _wellness_cache_lock = threading.Lock()
+
+# Short-lived in-memory cache for days that aren't persisted yet (today,
+# yesterday, not-yet-synced recent days). Several dashboard cards request the
+# same recent days in parallel on every page open; a per-day lock makes them
+# share one Garmin fetch, and the TTL keeps a quick reload from refetching.
+# Short enough that a fresh watch sync shows up within a couple of minutes.
+WELLNESS_RECENT_TTL_S = 120
+_recent_wellness_cache: dict[str, tuple[float, dict]] = {}
+_wellness_day_locks: dict[str, threading.Lock] = {}
+_monotonic = time.monotonic
 
 
 def _load_wellness_cache_from_disk() -> None:
@@ -282,7 +292,11 @@ def _fetch_wellness_day(client, d: str) -> dict:
     return {
         "date": d,
         "resting_hr": stats.get("restingHeartRate"),
+        # Most recent value: end-of-day for past days, but for today it keeps
+        # draining as the day goes on -- readiness uses the wake value instead.
         "body_battery": stats.get("bodyBatteryMostRecentValue"),
+        "body_battery_wake": stats.get("bodyBatteryAtWakeTime"),
+        "body_battery_charged": stats.get("bodyBatteryChargedValue"),
         "avg_stress": avg_stress,
         "sleep_hours": round(sleep_seconds / 3600, 2) if sleep_seconds else None,
         "sleep_score": overall_score.get("value"),
@@ -306,13 +320,27 @@ def _is_wellness_day_cacheable(day: dict, today: datetime.date) -> bool:
 def _wellness_day(client, d: str) -> dict:
     with _wellness_cache_lock:
         cached = _wellness_cache.get(d)
+        day_lock = _wellness_day_locks.setdefault(d, threading.Lock())
     if cached is not None:
         return dict(cached)
-    day = _fetch_wellness_day(client, d)
-    if _is_wellness_day_cacheable(day, datetime.date.today()):
+
+    with day_lock:  # concurrent requests for the same day wait for one fetch
         with _wellness_cache_lock:
-            _wellness_cache[d] = day
-    return dict(day)
+            cached = _wellness_cache.get(d)
+            recent = _recent_wellness_cache.get(d)
+        if cached is not None:
+            return dict(cached)
+        if recent is not None and _monotonic() - recent[0] < WELLNESS_RECENT_TTL_S:
+            return dict(recent[1])
+
+        day = _fetch_wellness_day(client, d)
+        with _wellness_cache_lock:
+            if _is_wellness_day_cacheable(day, datetime.date.today()):
+                _wellness_cache[d] = day
+                _recent_wellness_cache.pop(d, None)
+            elif not day["errors"]:  # failures are retried on the next request
+                _recent_wellness_cache[d] = (_monotonic(), day)
+        return dict(day)
 
 
 def _wellness_days(client, start: datetime.date, end: datetime.date) -> list[dict]:
@@ -433,6 +461,7 @@ def api_recovery(days: int = Query(default=14, ge=1, le=28)):
 SHORT_SLEEP_HOURS = 6
 HIGH_STRESS_LEVEL = 45     # Garmin 0-100 daily average; 26-50 is "low", 51+ "medium"
 TRAINING_READINESS_LOW = 40
+LOW_BODY_BATTERY_AT_WAKE = 25
 
 
 def _garmin_training_readiness(client, date: str) -> dict | None:
@@ -524,10 +553,18 @@ def api_readiness():
                 f"(+{today_rhr - baseline:.0f})"
             )
 
-    body_battery = last_night.get("body_battery")
-    if body_battery is not None and body_battery < 25:
-        flags += 1
-        reasons.append(f"Body Battery baixo: {body_battery}/100")
+    # Judge readiness on the wake value: the live value drains through the day,
+    # so an evening page load would otherwise flag a morning that was fine.
+    body_battery_wake = last_night.get("body_battery_wake")
+    charged = last_night.get("body_battery_charged")
+    body_battery_info = None
+    if body_battery_wake is not None:
+        charged_txt = f" (+{charged} recarregado durante a noite)" if charged is not None else ""
+        if body_battery_wake < LOW_BODY_BATTERY_AT_WAKE:
+            flags += 1
+            reasons.append(f"Body Battery baixo ao acordar: {body_battery_wake}/100{charged_txt}")
+        else:
+            body_battery_info = f"Body Battery ao acordar: {body_battery_wake}/100{charged_txt}"
 
     # Short sleep on its own is already a flag; after a high-stress day it's a
     # compounded recovery risk. Yesterday is the last complete day of stress.
@@ -564,6 +601,8 @@ def api_readiness():
 
     if not reasons:
         reasons.append("Sinais de recuperacao dentro do normal")
+    if body_battery_info:
+        reasons.append(body_battery_info)
 
     hrv_pending = last_night.get("hrv_avg") is None
     confidence = "alta" if not (sleep_pending or hrv_pending or last_night_errors) else "parcial"
