@@ -216,6 +216,9 @@ WELLNESS_CACHE_PATH = COACH_DATA_DIR / "wellness_cache.json"
 WELLNESS_RECENT_DAYS_ALWAYS_REFETCH = 2
 WELLNESS_SETTLED_DAYS = 7
 WELLNESS_CACHE_MAX_AGE_DAYS = 120
+# Bump when _fetch_wellness_day gains/changes fields: entries written by an
+# older version are dropped on load and simply refetched.
+WELLNESS_CACHE_VERSION = 2
 _wellness_cache: dict[str, dict] = {}
 _wellness_cache_lock = threading.Lock()
 
@@ -225,7 +228,12 @@ def _load_wellness_cache_from_disk() -> None:
         return
     try:
         with open(WELLNESS_CACHE_PATH, encoding="utf-8") as f:
-            _wellness_cache.update(json.load(f))
+            data = json.load(f)
+        _wellness_cache.update({
+            d: {k: v for k, v in entry.items() if k != "v"}
+            for d, entry in data.items()
+            if entry.get("v") == WELLNESS_CACHE_VERSION
+        })
     except Exception:
         pass  # corrupt/missing cache -- days are just refetched
 
@@ -237,7 +245,7 @@ def _save_wellness_cache_to_disk() -> None:
         with _wellness_cache_lock:
             for d in [d for d in _wellness_cache if d < cutoff]:
                 del _wellness_cache[d]
-            data = dict(_wellness_cache)
+            data = {d: {**entry, "v": WELLNESS_CACHE_VERSION} for d, entry in _wellness_cache.items()}
         tmp = WELLNESS_CACHE_PATH.with_suffix(".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f)
@@ -268,10 +276,14 @@ def _fetch_wellness_day(client, d: str) -> dict:
     sleep_seconds = daily_sleep.get("sleepTimeSeconds")
     overall_score = (daily_sleep.get("sleepScores") or {}).get("overall") or {}
     hrv_summary = hrv.get("hrvSummary") or {}
+    avg_stress = stats.get("averageStressLevel")
+    if avg_stress is not None and avg_stress < 0:
+        avg_stress = None  # Garmin uses negative levels for "not enough data"
     return {
         "date": d,
         "resting_hr": stats.get("restingHeartRate"),
         "body_battery": stats.get("bodyBatteryMostRecentValue"),
+        "avg_stress": avg_stress,
         "sleep_hours": round(sleep_seconds / 3600, 2) if sleep_seconds else None,
         "sleep_score": overall_score.get("value"),
         "hrv_avg": hrv_summary.get("lastNightAvg"),
@@ -418,6 +430,31 @@ def api_recovery(days: int = Query(default=14, ge=1, le=28)):
     return {"days": _wellness_days(client, start, end)}
 
 
+SHORT_SLEEP_HOURS = 6
+HIGH_STRESS_LEVEL = 45     # Garmin 0-100 daily average; 26-50 is "low", 51+ "medium"
+TRAINING_READINESS_LOW = 40
+
+
+def _garmin_training_readiness(client, date: str) -> dict | None:
+    """Garmin's own Training Readiness for `date`, if the device provides it.
+
+    Not every watch computes it (e.g. Forerunner 255 doesn't), in which case
+    Garmin returns an empty list and this returns None -- the readiness verdict
+    then just relies on our own signals.
+    """
+    try:
+        entries = client.get_training_readiness(date) or []
+    except Exception:
+        return None
+    if isinstance(entries, dict):
+        entries = [entries]
+    scored = [e for e in entries if isinstance(e, dict) and e.get("score") is not None]
+    if not scored:
+        return None
+    latest = max(scored, key=lambda e: e.get("timestamp") or "")
+    return {"score": latest["score"], "level": latest.get("level")}
+
+
 @app.get("/api/readiness")
 def api_readiness():
     """Rule-based readiness verdict for today's planned session.
@@ -442,7 +479,7 @@ def api_readiness():
     sleep_hours = last_night.get("sleep_hours")
     sleep_pending = sleep_hours is None
     if not sleep_pending:
-        if sleep_hours < 6:
+        if sleep_hours < SHORT_SLEEP_HOURS:
             flags += 1
             reasons.append(f"Sono curto: {sleep_hours}h esta noite (minimo recomendado 7h)")
         elif sleep_hours < 7:
@@ -492,6 +529,28 @@ def api_readiness():
         flags += 1
         reasons.append(f"Body Battery baixo: {body_battery}/100")
 
+    # Short sleep on its own is already a flag; after a high-stress day it's a
+    # compounded recovery risk. Yesterday is the last complete day of stress.
+    yesterday_stress = days_list[-2].get("avg_stress") if len(days_list) >= 2 else None
+    if (
+        sleep_hours is not None and sleep_hours < SHORT_SLEEP_HOURS
+        and yesterday_stress is not None and yesterday_stress >= HIGH_STRESS_LEVEL
+    ):
+        flags += 1
+        reasons.append(
+            f"Sono curto depois de um dia de stress elevado (stress medio ontem {yesterday_stress}) "
+            "-- combinacao ruim para treino intenso"
+        )
+
+    training_readiness = _garmin_training_readiness(client, today_str)
+    if training_readiness is not None:
+        score, level = training_readiness["score"], training_readiness["level"]
+        if score < TRAINING_READINESS_LOW:
+            flags += 1
+            reasons.append(f"Training Readiness do Garmin baixo: {score}/100 ({level})")
+        else:
+            reasons.append(f"Training Readiness do Garmin: {score}/100 ({level})")
+
     # Without last night's sleep a clean slate is not evidence of readiness, so
     # don't call it "apto"; warning flags from other signals still stand.
     if flags == 0 and sleep_pending:
@@ -519,6 +578,8 @@ def api_readiness():
         "confidence": confidence,
         "flags": flags,
         "reasons": reasons,
+        "training_readiness": training_readiness,
+        "yesterday_stress": yesterday_stress,
         "today_plan": plan,
         "next_plan": next_plan,
         "snapshot": last_night,
@@ -1443,6 +1504,9 @@ def api_weekly_closing():
     if not flags:
         flags.append("Sem sinais particulares esta semana.")
 
+    wellness = _wellness_days(client, prior_start, closed_end)
+    recovery = _weekly_recovery_comparison(wellness[7:], wellness[:7])
+
     return {
         "week_start": closed_start.isoformat(),
         "week_end": closed_end.isoformat(),
@@ -1451,6 +1515,87 @@ def api_weekly_closing():
         "target_km": target_km,
         "pace_delta_min_per_km": pace_delta,
         "flags": flags,
+        "recovery": recovery,
+    }
+
+
+RECOVERY_METRICS = {
+    # key: (wellness-day field, decimals -- None rounds to an int)
+    "sleep_hours": ("sleep_hours", 1),
+    "hrv_avg": ("hrv_avg", None),
+    "resting_hr": ("resting_hr", None),
+    "avg_stress": ("avg_stress", None),
+    "body_battery_end": ("body_battery", None),
+}
+LOW_WEEKLY_SLEEP_HOURS = 6.5
+
+
+def _recovery_averages(days: list[dict]) -> dict:
+    out = {}
+    for key, (field, decimals) in RECOVERY_METRICS.items():
+        values = [d[field] for d in days if d.get(field) is not None]
+        out[key] = round(sum(values) / len(values), decimals) if values else None
+    out["days_with_sleep"] = sum(1 for d in days if d.get("sleep_hours") is not None)
+    out["days_with_hrv"] = sum(1 for d in days if d.get("hrv_avg") is not None)
+    return out
+
+
+def _pct_change(current, previous):
+    if current is None or previous is None or previous == 0:
+        return None
+    return (current - previous) / previous * 100
+
+
+def _weekly_recovery_comparison(week: list[dict], prior_week: list[dict]) -> dict:
+    """Closed week's recovery averages vs the week before, plus bottlenecks.
+
+    Thresholds follow the overtraining/readiness checks: sustained short sleep,
+    elevated stress, and material swings versus the previous week. Sparse data
+    is called out instead of being over-interpreted.
+    """
+    current = _recovery_averages(week)
+    previous = _recovery_averages(prior_week)
+    delta = {
+        key: round(current[key] - previous[key], decimals)
+        if current[key] is not None and previous[key] is not None else None
+        for key, (_, decimals) in RECOVERY_METRICS.items()
+    }
+
+    bottlenecks = []
+    if current["sleep_hours"] is not None and current["sleep_hours"] < LOW_WEEKLY_SLEEP_HOURS:
+        bottlenecks.append(
+            f"Sono medio de {current['sleep_hours']}h na semana, abaixo de {LOW_WEEKLY_SLEEP_HOURS}h "
+            "-- a recuperacao pode ser o fator limitante"
+        )
+    sleep_pct = _pct_change(current["sleep_hours"], previous["sleep_hours"])
+    if sleep_pct is not None and sleep_pct < -10:
+        bottlenecks.append(f"Sono caiu {abs(sleep_pct):.0f}% vs semana anterior")
+    hrv_pct = _pct_change(current["hrv_avg"], previous["hrv_avg"])
+    if hrv_pct is not None and hrv_pct < -10:
+        bottlenecks.append(f"HRV media caiu {abs(hrv_pct):.0f}% vs semana anterior")
+    if delta["resting_hr"] is not None and delta["resting_hr"] >= 3:
+        bottlenecks.append(f"FC repouso media subiu {delta['resting_hr']:.0f}bpm vs semana anterior")
+    if current["avg_stress"] is not None and current["avg_stress"] >= HIGH_STRESS_LEVEL:
+        bottlenecks.append(f"Stress medio elevado na semana ({current['avg_stress']:.0f})")
+    stress_pct = _pct_change(current["avg_stress"], previous["avg_stress"])
+    if stress_pct is not None and stress_pct > 20:
+        bottlenecks.append(f"Stress subiu {stress_pct:.0f}% vs semana anterior")
+    if current["days_with_hrv"] < 3:
+        bottlenecks.append(f"HRV so em {current['days_with_hrv']} de 7 noites -- nao da pra tirar conclusoes de HRV")
+    if current["days_with_sleep"] < 3:
+        bottlenecks.append(f"Sono so em {current['days_with_sleep']} de 7 noites -- baixa confianca")
+    if not bottlenecks:
+        bottlenecks.append("Recuperacao estavel vs semana anterior")
+
+    days_with_sleep = current["days_with_sleep"]
+    confidence = "alta" if days_with_sleep >= 5 else ("media" if days_with_sleep >= 3 else "baixa")
+
+    return {
+        "current": current,
+        "previous": previous,
+        "delta": delta,
+        "bottlenecks": bottlenecks,
+        "confidence": confidence,
     }
 
 

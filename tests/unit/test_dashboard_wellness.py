@@ -29,9 +29,10 @@ def day(offset: int) -> str:
 class FakeGarmin:
     """Minimal stand-in for garminconnect.Garmin's wellness endpoints."""
 
-    def __init__(self, data=None, failing=()):
-        self.data = data or {}  # date -> {"rhr", "bb", "sleep_s", "score", "hrv", "hrv_status"}
+    def __init__(self, data=None, failing=(), training_readiness=None):
+        self.data = data or {}  # date -> {"rhr", "bb", "stress", "sleep_s", "score", "hrv", "hrv_status"}
         self.failing = set(failing)  # (method, date) pairs that raise
+        self.training_readiness = training_readiness if training_readiness is not None else []
         self.calls = []
 
     def _maybe_fail(self, method, d):
@@ -42,7 +43,11 @@ class FakeGarmin:
     def get_stats(self, d):
         self._maybe_fail("stats", d)
         v = self.data.get(d, {})
-        return {"restingHeartRate": v.get("rhr"), "bodyBatteryMostRecentValue": v.get("bb")}
+        return {
+            "restingHeartRate": v.get("rhr"),
+            "bodyBatteryMostRecentValue": v.get("bb"),
+            "averageStressLevel": v.get("stress"),
+        }
 
     def get_sleep_data(self, d):
         self._maybe_fail("sleep", d)
@@ -61,9 +66,14 @@ class FakeGarmin:
             return None
         return {"hrvSummary": {"lastNightAvg": v["hrv"], "status": v.get("hrv_status", "BALANCED")}}
 
+    def get_training_readiness(self, d):
+        if isinstance(self.training_readiness, Exception):
+            raise self.training_readiness
+        return self.training_readiness
 
-def full_day(rhr=50, sleep_h=7.5, hrv=60):
-    return {"rhr": rhr, "bb": 70, "sleep_s": int(sleep_h * 3600), "score": 80, "hrv": hrv}
+
+def full_day(rhr=50, sleep_h=7.5, hrv=60, stress=25):
+    return {"rhr": rhr, "bb": 70, "stress": stress, "sleep_s": int(sleep_h * 3600), "score": 80, "hrv": hrv}
 
 
 @pytest.fixture(autouse=True)
@@ -273,3 +283,116 @@ def test_endpoints_share_the_cache(monkeypatch):
     # Only uncached days are fetched again: today+yesterday per endpoint, plus
     # the 12 older overtraining days not covered by readiness's window.
     assert len(client.calls) - first == 3 * (2 + 12) + 3 * 2
+
+
+# ------------------------------------------------- stress + Garmin Training Readiness
+
+def test_negative_stress_means_no_data():
+    client = FakeGarmin({day(10): {**full_day(), "stress": -1}})
+    assert dash._wellness_day(client, day(10))["avg_stress"] is None
+
+
+def test_cache_entries_from_older_version_are_dropped(isolated_cache):
+    (isolated_cache / "wellness_cache.json").write_text(json.dumps({
+        day(10): {"date": day(10), "resting_hr": 50},  # v1: no version, no avg_stress
+        day(11): {"date": day(11), "resting_hr": 51, "avg_stress": 20, "v": dash.WELLNESS_CACHE_VERSION},
+    }), encoding="utf-8")
+    dash._load_wellness_cache_from_disk()
+    assert list(dash._wellness_cache) == [day(11)]
+    assert "v" not in dash._wellness_cache[day(11)]
+
+
+def test_short_sleep_after_stressful_day_adds_a_second_flag(monkeypatch):
+    data = history(sleep_s=int(5.5 * 3600))
+    data[day(1)]["stress"] = 50
+    r = readiness_with(FakeGarmin(data), monkeypatch)
+    assert r["flags"] == 2 and r["verdict"] == "nao_apto"
+    assert r["yesterday_stress"] == 50
+    assert any("stress elevado" in x for x in r["reasons"])
+
+
+def test_short_sleep_after_calm_day_is_a_single_flag(monkeypatch):
+    r = readiness_with(FakeGarmin(history(sleep_s=int(5.5 * 3600))), monkeypatch)
+    assert r["flags"] == 1 and r["verdict"] == "cautela"
+
+
+def test_low_garmin_training_readiness_is_a_flag(monkeypatch):
+    tr = [{"score": 55, "level": "MODERATE", "timestamp": "2026-01-01T06:00:00"},
+          {"score": 32, "level": "LOW", "timestamp": "2026-01-01T09:00:00"}]
+    r = readiness_with(FakeGarmin(history(), training_readiness=tr), monkeypatch)
+    assert r["training_readiness"] == {"score": 32, "level": "LOW"}  # latest entry wins
+    assert r["verdict"] == "cautela"
+
+
+def test_good_garmin_training_readiness_is_informational(monkeypatch):
+    tr = [{"score": 78, "level": "HIGH", "timestamp": "2026-01-01T06:00:00"}]
+    r = readiness_with(FakeGarmin(history(), training_readiness=tr), monkeypatch)
+    assert r["verdict"] == "apto"
+    assert any("78/100" in x for x in r["reasons"])
+
+
+@pytest.mark.parametrize("tr", [[], GarminConnectConnectionError("API client error (404)")])
+def test_missing_training_readiness_is_ignored(monkeypatch, tr):
+    # e.g. Forerunner 255: Garmin returns [] -- the verdict relies on our signals only
+    r = readiness_with(FakeGarmin(history(), training_readiness=tr), monkeypatch)
+    assert r["training_readiness"] is None
+    assert r["verdict"] == "apto"
+    assert not any("Training Readiness" in x for x in r["reasons"])
+
+
+# ------------------------------------------------------ weekly recovery comparison
+
+def week(sleep_h=7.5, hrv=60, rhr=50, stress=25, bb=40, n=7):
+    return [
+        {"sleep_hours": sleep_h, "hrv_avg": hrv, "resting_hr": rhr, "avg_stress": stress, "body_battery": bb}
+        for _ in range(n)
+    ]
+
+
+def test_weekly_recovery_stable():
+    rec = dash._weekly_recovery_comparison(week(), week())
+    assert rec["bottlenecks"] == ["Recuperacao estavel vs semana anterior"]
+    assert rec["confidence"] == "alta"
+    assert rec["delta"] == {k: 0 for k in dash.RECOVERY_METRICS}
+    assert isinstance(rec["current"]["hrv_avg"], int)  # renders "60ms", not "60.0ms"
+    assert isinstance(rec["delta"]["resting_hr"], int)
+
+
+def test_weekly_recovery_flags_declines():
+    rec = dash._weekly_recovery_comparison(
+        week(sleep_h=6.0, hrv=50, rhr=54, stress=48),
+        week(sleep_h=7.5, hrv=60, rhr=50, stress=30),
+    )
+    text = " | ".join(rec["bottlenecks"])
+    assert "abaixo de 6.5h" in text
+    assert "Sono caiu 20%" in text
+    assert "HRV media caiu 17%" in text
+    assert "FC repouso media subiu 4bpm" in text
+    assert "Stress medio elevado" in text
+    assert "Stress subiu 60%" in text
+    assert rec["delta"]["sleep_hours"] == -1.5 and rec["delta"]["resting_hr"] == 4
+
+
+def test_weekly_recovery_calls_out_sparse_data():
+    sparse = week(n=2) + [{} for _ in range(5)]
+    rec = dash._weekly_recovery_comparison(sparse, [{} for _ in range(7)])
+    assert rec["confidence"] == "baixa"
+    assert rec["delta"]["sleep_hours"] is None
+    assert any("HRV so em 2 de 7" in b for b in rec["bottlenecks"])
+
+
+def test_weekly_closing_includes_recovery(monkeypatch):
+    monday = TODAY - datetime.timedelta(days=TODAY.weekday())
+    data = {}
+    for i in range(1, 15):  # the two full weeks before this one
+        d = (monday - datetime.timedelta(days=i)).isoformat()
+        data[d] = full_day(sleep_h=7.0 if i <= 7 else 8.0)
+    client = FakeGarmin(data)
+    client.get_activities_by_date = lambda start, end: []
+    monkeypatch.setattr(dash, "get_client", lambda: client)
+    monkeypatch.setattr(dash, "_week_target_from_mesocycle", lambda d: None)
+    rec = dash.api_weekly_closing()["recovery"]
+    assert rec["current"]["sleep_hours"] == 7.0
+    assert rec["previous"]["sleep_hours"] == 8.0
+    assert rec["delta"]["sleep_hours"] == -1.0
+    assert any("Sono caiu 12%" in b for b in rec["bottlenecks"])

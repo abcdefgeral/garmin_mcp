@@ -278,6 +278,8 @@
   .wc-stat .wc-value { font-size: 1.3rem; font-weight: 650; font-variant-numeric: tabular-nums; }
   .wc-flags { margin: 0; padding-left: 20px; font-size: 0.85rem; color: var(--text-secondary); }
   .wc-flags li { margin-bottom: 4px; }
+  .wc-section { margin: 18px 0 8px; font-size: 0.8rem; font-weight: 650; color: var(--text-secondary); }
+  .wc-stat .wc-delta { color: var(--text-muted); font-size: 0.78rem; font-variant-numeric: tabular-nums; }
 
   .range-toggle { display: flex; gap: 6px; flex-wrap: wrap; }
   .range-toggle button {
@@ -969,7 +971,29 @@ async function loadWeeklyClosing() {
     </div>
   `;
   const flagsHtml = `<ul class="wc-flags">${w.flags.map(f => `<li>${f}</li>`).join("")}</ul>`;
-  body.innerHTML = stats + flagsHtml;
+  body.innerHTML = stats + flagsHtml + weeklyRecoveryHtml(w.recovery);
+}
+
+function weeklyRecoveryHtml(rec) {
+  if (!rec) return "";
+  const fmtDelta = (d, unit) => d == null ? "sem comparação" : `${d > 0 ? "+" : d < 0 ? "−" : "±"}${Math.abs(d)}${unit} vs anterior`;
+  const stat = (label, key, unit) => {
+    const v = rec.current[key];
+    return `<div class="wc-stat"><div class="wc-label">${label}</div>
+      <div class="wc-value">${v != null ? `${v}${unit}` : "—"}</div>
+      <div class="wc-delta">${fmtDelta(rec.delta[key], unit)}</div></div>`;
+  };
+  const confidenceTxt = rec.confidence === "alta" ? "" : ` <span class="badge badge-pending">confiança ${rec.confidence}</span>`;
+  return `
+    <div class="wc-section">Recuperação (média da semana)${confidenceTxt}</div>
+    <div class="wc-stats">
+      ${stat("Sono", "sleep_hours", "h")}
+      ${stat("HRV", "hrv_avg", "ms")}
+      ${stat("FC repouso", "resting_hr", "bpm")}
+      ${stat("Stress", "avg_stress", "")}
+      ${stat("Body Battery (fim do dia)", "body_battery_end", "")}
+    </div>
+    <ul class="wc-flags">${rec.bottlenecks.map(b => `<li>${b}</li>`).join("")}</ul>`;
 }
 
 async function loadFitnessFreshness() {
